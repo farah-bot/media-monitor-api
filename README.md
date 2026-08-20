@@ -1,98 +1,89 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+## Stack
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+- NestJS + TypeScript
+- PostgreSQL, via `node-pg-migrate` (plain SQL, no ORM auto-sync)
+- raw `pg` for queries
+- Jest + Supertest
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Run it
 
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
+Requires Node 20+, Docker (or a local Postgres 15+).
 
 ```bash
-$ npm install
+git clone && cd media-monitor-api
+npm install
+docker compose up -d
+cp .env.example .env
+npm run migrate:up
+npm run start:dev
+# → http://localhost:3000, API docs at /docs
 ```
 
-## Compile and run the project
+Seed sample data: `npm run seed`
 
-```bash
-# development
-$ npm run start
+Tests: `npm test` (unit) and `DATABASE_URL=... npm run test:e2e` (integration,
+needs migrations already applied).
 
-# watch mode
-$ npm run start:dev
+## Endpoints
 
-# production mode
-$ npm run start:prod
-```
+- `POST /internal/mentions/bulk` — accepts a raw JSON array (shape of
+  `seed/seed_mentions.json`). Invalid records are skipped, not fatal.
+  Returns `{ received, inserted, updated, flagged_duplicate, skipped_invalid, errors }`.
+- `GET /mentions?q=&source=&from=&to=&page=&limit=&include_duplicates=` —
+  sorted `published_at DESC NULLS LAST, id ASC` (stable, `id` breaks ties).
+- `GET /mentions/stats?group_by=source|day` — counts, duplicates excluded.
+- `GET /health` — liveness check.
 
-## Run tests
+## Schema
 
-```bash
-# unit tests
-$ npm run test
+`mentions(id, external_id, source_raw, source_normalized, title, content_raw,
+content_clean, url, author, published_at, engagement, content_hash,
+duplicate_of_id, created_at, updated_at)`, unique on
+`(source_normalized, external_id)`.
 
-# e2e tests
-$ npm run test:e2e
+- `source_raw`/`source_normalized`: original kept for audit; everything else
+  (filter, group-by, dedup key) uses the canonical name.
+- `content_hash`: sha256 of normalized title+content, used to flag
+  near-duplicates arriving under a different `external_id`/URL.
+- `duplicate_of_id`: set when a near-duplicate is found. Row is kept, not
+  discarded — just excluded from search/stats by default.
 
-# test coverage
-$ npm run test:cov
-```
+## Duplicate detection
 
-## Deployment
+Two mechanisms for two different problems in the seed data:
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+1. **Retries / exact re-post** (`str-99120` posted twice) →
+   `UNIQUE(source_normalized, external_id)` + `ON CONFLICT DO UPDATE`. This
+   is what makes the bulk endpoint idempotent.
+2. **Cross-source near-duplicate** (`mkn-1201` vs `mkn-1202`: different ID
+   and URL, same story, title differs by a hyphen) → not catchable by a
+   unique key. Flagged via `content_hash` instead — the row is inserted but
+   marked `duplicate_of_id`, so it's still auditable but not double-counted.
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+Chose flag-over-reject because the brief says the pipeline retries on
+failure and ingestion is inherently messy — better to keep the data and let
+an analyst see it was picked up twice than silently drop it.
 
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
+## Assumptions
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+- Timestamps with no timezone are assumed UTC.
+- Unparseable `published_at` → `NULL` (bucketed as `"unknown"` in daily stats).
+- Unparseable `engagement` → `0`.
+- Unknown sources are title-cased and kept, not dropped.
+- `/internal/mentions/bulk` has no auth — assumed internal-only route.
 
-## Resources
+## Trade-offs
 
-Check out a few resources that may come in handy when working with NestJS:
+- `ILIKE` for `q`, not full-text search — simpler, fine at this scale.
+- Content-hash dedup is exact-after-normalization, not fuzzy — won't catch a
+  heavily reworded duplicate.
+- Offset pagination, not keyset — simpler, fine at this scale.
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+## Time spent
 
-## Support
+~2–3 hours across 2 sessions.
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+## With another week
 
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Full-text search, trigram-based fuzzy dedup, rate limiting on bulk ingest,
+a minimal read-only dashboard.
