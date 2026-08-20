@@ -32,7 +32,7 @@ describeIfDb('Mentions e2e', () => {
     await app.init();
     pool = app.get(PG_POOL);
     await pool.query('DELETE FROM mentions');
-  });
+  }, 30000);
 
   afterAll(async () => {
     await pool.query('DELETE FROM mentions');
