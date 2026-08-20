@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { MentionRecordDto } from './dto/bulk-ingest.dto';
+import { SearchMentionsDto, StatsQueryDto } from './dto/search-mentions.dto';
 import { MentionsRepository } from './mentions.repository';
 import {
   hashContent,
@@ -34,6 +35,7 @@ export class MentionsService {
       errors: [],
     };
 
+    // validasi dulu, record invalid di-skip bukan bikin gagal semua
     const toProcess: { index: number; dto: MentionRecordDto }[] = [];
     for (let i = 0; i < rawRecords.length; i++) {
       const dto = plainToInstance(MentionRecordDto, rawRecords[i]);
@@ -59,6 +61,7 @@ export class MentionsService {
         const publishedAt = parsePublishedAt(dto.published_at);
         const engagement = parseEngagement(dto.engagement);
 
+        // cek konten sama dari record lain
         const duplicateOfId = await this.repo.findByContentHash(
           client,
           contentHash,
@@ -67,6 +70,7 @@ export class MentionsService {
         );
         if (duplicateOfId) summary.flagged_duplicate++;
 
+        // upsert; (source_normalized, external_id) = idempotency key
         const result = await this.repo.upsert(
           client,
           {
@@ -91,5 +95,32 @@ export class MentionsService {
     });
 
     return summary;
+  }
+
+  async search(query: SearchMentionsDto) {
+    const from = query.from ? new Date(query.from) : undefined;
+    const to = query.to ? new Date(query.to) : undefined;
+    if (from && to && from > to) {
+      throw new BadRequestException('"from" must be before "to"');
+    }
+
+    const { data, total } = await this.repo.search({
+      q: query.q,
+      source: query.source ? normalizeSource(query.source) : undefined,
+      from,
+      to,
+      page: query.page,
+      limit: query.limit,
+      includeDuplicates: query.include_duplicates === 'true',
+    });
+
+    return { data, page: query.page, limit: query.limit, total };
+  }
+
+  async stats(query: StatsQueryDto) {
+    if (query.group_by === 'source') {
+      return { group_by: 'source', results: await this.repo.statsBySource() };
+    }
+    return { group_by: 'day', results: await this.repo.statsByDay() };
   }
 }

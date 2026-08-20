@@ -21,6 +21,34 @@ export interface UpsertMentionResult {
   inserted: boolean;
 }
 
+export interface SearchParams {
+  q?: string;
+  source?: string;
+  from?: Date;
+  to?: Date;
+  page: number;
+  limit: number;
+  includeDuplicates: boolean;
+}
+
+export interface MentionRow {
+  id: string;
+  external_id: string;
+  source: string;
+  title: string | null;
+  content: string;
+  url: string | null;
+  author: string | null;
+  published_at: Date | null;
+  engagement: number;
+  duplicate_of_id: string | null;
+}
+
+export interface StatRow {
+  key: string;
+  count: number;
+}
+
 @Injectable()
 export class MentionsRepository {
   constructor(@Inject(PG_POOL) private readonly pool: Pool) {}
@@ -40,6 +68,7 @@ export class MentionsRepository {
     }
   }
 
+  // cari baris lain dgn content_hash sama (bukan diri sendiri, bukan yg udah duplikat)
   async findByContentHash(
     client: PoolClient,
     contentHash: string,
@@ -58,6 +87,7 @@ export class MentionsRepository {
     return res.rows[0]?.id ?? null;
   }
 
+  // upsert per record; (source_normalized, external_id) jadi idempotency key
   async upsert(
     client: PoolClient,
     input: UpsertMentionInput,
@@ -98,5 +128,85 @@ export class MentionsRepository {
       ],
     );
     return res.rows[0];
+  }
+
+  async search(
+    params: SearchParams,
+  ): Promise<{ data: MentionRow[]; total: number }> {
+    const conditions: string[] = [];
+    const values: any[] = [];
+
+    if (!params.includeDuplicates) {
+      conditions.push('duplicate_of_id IS NULL');
+    }
+    if (params.q) {
+      values.push(`%${params.q}%`);
+      conditions.push(
+        `(title ILIKE $${values.length} OR content_clean ILIKE $${values.length})`,
+      );
+    }
+    if (params.source) {
+      values.push(params.source);
+      conditions.push(`source_normalized = $${values.length}`);
+    }
+    if (params.from) {
+      values.push(params.from);
+      conditions.push(`published_at >= $${values.length}`);
+    }
+    if (params.to) {
+      values.push(params.to);
+      conditions.push(`published_at <= $${values.length}`);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const offset = (params.page - 1) * params.limit;
+
+    values.push(params.limit);
+    const limitIdx = values.length;
+    values.push(offset);
+    const offsetIdx = values.length;
+
+    const dataQuery = `
+      SELECT id, external_id, source_normalized AS source, title, content_clean AS content,
+             url, author, published_at, engagement, duplicate_of_id
+      FROM mentions
+      ${where}
+      ORDER BY published_at DESC NULLS LAST, id ASC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+    `;
+    const countQuery = `SELECT COUNT(*)::int AS total FROM mentions ${where}`;
+
+    const [dataRes, countRes] = await Promise.all([
+      this.pool.query<MentionRow>(dataQuery, values),
+      this.pool.query<{ total: number }>(
+        countQuery,
+        values.slice(0, values.length - 2),
+      ),
+    ]);
+
+    return { data: dataRes.rows, total: countRes.rows[0].total };
+  }
+
+  async statsBySource(): Promise<StatRow[]> {
+    const res = await this.pool.query<StatRow>(
+      `SELECT source_normalized AS key, COUNT(*)::int AS count
+       FROM mentions
+       WHERE duplicate_of_id IS NULL
+       GROUP BY source_normalized
+       ORDER BY count DESC`,
+    );
+    return res.rows;
+  }
+
+  async statsByDay(): Promise<StatRow[]> {
+    const res = await this.pool.query<StatRow>(
+      `SELECT COALESCE(date_trunc('day', published_at)::date::text, 'unknown') AS key,
+              COUNT(*)::int AS count
+       FROM mentions
+       WHERE duplicate_of_id IS NULL
+       GROUP BY 1
+       ORDER BY 1`,
+    );
+    return res.rows;
   }
 }
